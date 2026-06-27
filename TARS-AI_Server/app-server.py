@@ -207,6 +207,10 @@ def detect_device():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         return "cuda"
+    # Apple Silicon MPS (M-series)
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        log.info("Apple Silicon MPS detected — using MPS for transformer models")
+        return "mps"
     # Warn if NVIDIA GPU exists but torch lacks CUDA
     if _has_nvidia_gpu():
         log.warning(
@@ -518,6 +522,9 @@ class STTService:
         from faster_whisper import WhisperModel
 
         device = device or DEVICE
+        # ctranslate2 (faster-whisper backend) does not support MPS — fall back to CPU
+        if device == "mps":
+            device = "cpu"
         if compute_type == "auto":
             compute_type = "float16" if device == "cuda" else "int8"
 
@@ -775,6 +782,9 @@ class LLMService:
             if device == "cuda" and torch.cuda.is_bf16_supported():
                 dtype = torch.bfloat16
             elif device == "cuda":
+                dtype = torch.float16
+            elif device == "mps":
+                # Apple Silicon: bfloat16 not supported on older MPS, use float16
                 dtype = torch.float16
             else:
                 dtype = torch.float32

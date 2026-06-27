@@ -1,13 +1,7 @@
 # TARS-AI Companion Server Dependencies
-# Install: pip install -r requirements-server.txt
+# macOS/Apple Silicon version — CUDA lines removed, torch installed separately for MPS
 
-# PyTorch CUDA 12.4 as primary index so torch/torchaudio always install as GPU builds.
-# All other packages fall back to PyPI via --extra-index-url.
-# For CPU-only installs, remove these two lines and just "pip install torch torchaudio".
---index-url https://download.pytorch.org/whl/cu124
---extra-index-url https://pypi.org/simple
-
-# Core — install torch first so CUDA variant is picked from the index above.
+# Core
 torch>=2.6.0
 torchaudio>=2.6.0
 python-multipart
@@ -40,10 +34,3 @@ qrcode[pil]>=7.0
 
 # Quantization (8-bit / 4-bit LLM inference)
 bitsandbytes>=0.43.0
-
-# LLM - llama.cpp backend (GGUF models)
-# NOT listed here — installed automatically at runtime by app-server.py using
-# pre-built wheels (no compiler required). See _ensure_llamacpp() in app-server.py.
-# Manual install if needed:
-#   GPU: pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --prefer-binary
-#   CPU: pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu --prefer-binary
