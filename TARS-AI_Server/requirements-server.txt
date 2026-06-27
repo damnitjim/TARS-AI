@@ -23,6 +23,15 @@ accelerate>=0.27.0
 # Vision - Image Captioning (BLIP)
 Pillow>=10.0.0
 
+# Apple-Silicon MLX backends (optional, macOS only) — selected via config:
+#   [vision] model = mlx-community/...        -> mlx-vlm  (e.g. Qwen2.5-VL-7B-Instruct-4bit)
+#   [stt]    whisper_model = mlx-community/... -> mlx-whisper (e.g. whisper-large-v3-turbo)
+#   [tts]    engine = kokoro                  -> mlx-audio + misaki (Kokoro-82M)
+mlx-vlm>=0.6.3
+mlx-whisper>=0.4.3
+mlx-audio>=0.4.4
+misaki[en]>=0.9.4
+
 # Image Generation (Stable Diffusion via diffusers)
 diffusers>=0.27.0
 

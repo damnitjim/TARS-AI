@@ -514,31 +514,50 @@ from concurrent.futures import ThreadPoolExecutor
 _INFERENCE_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tars-inference")
 
 # ===================================================================
-# STT Service (faster-whisper + Silero VAD)
+# STT Service (faster-whisper or MLX-Whisper, + Silero VAD)
 # ===================================================================
+class _STTInfo:
+    """Minimal stand-in for faster-whisper's TranscriptionInfo (MLX path)."""
+    __slots__ = ("language", "language_probability")
+
+    def __init__(self, language, language_probability):
+        self.language = language
+        self.language_probability = language_probability
+
+
 class STTService:
     def __init__(self, model_size: str = "large-v3", compute_type: str = "auto",
                  vad_filter: bool = True, device: str = None):
-        from faster_whisper import WhisperModel
-
-        device = device or DEVICE
-        # ctranslate2 (faster-whisper backend) does not support MPS — fall back to CPU
-        if device == "mps":
-            device = "cpu"
-        if compute_type == "auto":
-            compute_type = "float16" if device == "cuda" else "int8"
-
-        log.info(f"Loading Whisper model: {model_size} (compute: {compute_type}, device: {device})...")
         self.model_name = model_size
-        whisper_dir = MODELS_DIR / "whisper"
-        whisper_dir.mkdir(exist_ok=True)
-        self.model = WhisperModel(
-            model_size,
-            device=device,
-            compute_type=compute_type,
-            download_root=str(whisper_dir),
-        )
-        log.info("Whisper model loaded.")
+        # An MLX repo name (e.g. mlx-community/whisper-large-v3-turbo) selects the
+        # Apple-Silicon MLX backend; anything else uses faster-whisper.
+        self.use_mlx = "mlx" in model_size.lower()
+
+        if self.use_mlx:
+            import mlx_whisper  # noqa: F401  (validate availability; weights load lazily + cached)
+            log.info(f"Loading MLX-Whisper model: {model_size} (lazy, Metal)...")
+            self.model = None
+            log.info("MLX-Whisper ready.")
+        else:
+            from faster_whisper import WhisperModel
+
+            device = device or DEVICE
+            # ctranslate2 (faster-whisper backend) does not support MPS — fall back to CPU
+            if device == "mps":
+                device = "cpu"
+            if compute_type == "auto":
+                compute_type = "float16" if device == "cuda" else "int8"
+
+            log.info(f"Loading Whisper model: {model_size} (compute: {compute_type}, device: {device})...")
+            whisper_dir = MODELS_DIR / "whisper"
+            whisper_dir.mkdir(exist_ok=True)
+            self.model = WhisperModel(
+                model_size,
+                device=device,
+                compute_type=compute_type,
+                download_root=str(whisper_dir),
+            )
+            log.info("Whisper model loaded.")
 
         # Silero VAD for pre-filtering
         self._vad_model = None
@@ -637,6 +656,8 @@ class STTService:
             return None
 
     def transcribe(self, audio_bytes: BytesIO, language: str = None) -> tuple[list[dict], object]:
+        if self.use_mlx:
+            return self._transcribe_mlx(audio_bytes, language)
         kwargs = {"beam_size": 1}  # greedy decoding — ~3x faster, negligible quality loss for speech
         if language:
             kwargs["language"] = language
@@ -647,6 +668,26 @@ class STTService:
         ]
         return results, info
 
+    def _transcribe_mlx(self, audio_bytes: BytesIO, language: str = None) -> tuple[list[dict], object]:
+        import mlx_whisper
+        # Reuse the WAV decoder (16 kHz float32 mono) — no ffmpeg needed.
+        tensor = self._wav_bytes_to_tensor(audio_bytes)
+        if tensor is None:
+            return [], _STTInfo(language=language, language_probability=0.0)
+        audio = tensor.numpy().astype("float32")
+        kwargs = {"path_or_hf_repo": self.model_name}
+        if language:
+            kwargs["language"] = language
+        r = mlx_whisper.transcribe(audio, **kwargs)
+        results = [
+            {"text": s["text"].strip(),
+             "start": round(float(s.get("start", 0.0)), 3),
+             "end": round(float(s.get("end", 0.0)), 3)}
+            for s in r.get("segments", [])
+        ]
+        info = _STTInfo(language=r.get("language"), language_probability=1.0)
+        return results, info
+
     def unload(self):
         del self.model
         self.model = None
@@ -654,23 +695,41 @@ class STTService:
 
 
 # ===================================================================
-# TTS Service (Piper ONNX + cache)
+# TTS Service (Piper ONNX or Kokoro/MLX, + cache)
 # ===================================================================
+# Curated Kokoro v1.0 voices (American + British English).
+_KOKORO_VOICES = (
+    "af_heart", "af_bella", "af_nicole", "af_sarah",
+    "am_michael", "am_fenrir", "am_puck",
+    "bf_emma", "bm_george",
+)
+
+
 class TTSService:
     _DEFAULT_VOICE_URLS = {
         "TARS.onnx": "https://github.com/TARS-AI-Community/TARS-AI/raw/refs/heads/V3/src/character/TARS/voice/TARS.onnx",
         "TARS.onnx.json": "https://github.com/TARS-AI-Community/TARS-AI/raw/refs/heads/V3/src/character/TARS/voice/TARS.onnx.json",
     }
 
-    def __init__(self, voices_dir: str = None, cache_size: int = 100):
-        self.voices_dir = Path(voices_dir) if voices_dir else Path(__file__).parent / "tts"
-        self.voices_dir.mkdir(parents=True, exist_ok=True)
-        self._voices: dict = {}
-        self._loaded_voices: dict = {}  # name -> PiperVoice (kept in memory)
+    def __init__(self, voices_dir: str = None, cache_size: int = 100,
+                 engine: str = "piper", mlx_model: str = "prince-canuma/Kokoro-82M",
+                 mlx_voice: str = "af_heart"):
         self._cache: collections.OrderedDict = collections.OrderedDict()
         self._cache_max = cache_size
-        self._ensure_default_voice()
-        self._scan_voices()
+        self.engine = "kokoro" if engine.lower() in ("kokoro", "mlx") else "piper"
+
+        if self.engine == "kokoro":
+            self.mlx_model = mlx_model
+            self.mlx_voice = mlx_voice
+            self._kokoro = None  # lazy-loaded on first synth
+            log.info(f"TTS engine: Kokoro/MLX ({mlx_model}, default voice '{mlx_voice}')")
+        else:
+            self.voices_dir = Path(voices_dir) if voices_dir else Path(__file__).parent / "tts"
+            self.voices_dir.mkdir(parents=True, exist_ok=True)
+            self._voices: dict = {}
+            self._loaded_voices: dict = {}  # name -> PiperVoice (kept in memory)
+            self._ensure_default_voice()
+            self._scan_voices()
 
     def _ensure_default_voice(self):
         """Download the default TARS Piper voice if no .onnx files exist yet."""
@@ -701,6 +760,8 @@ class TTSService:
         log.info(f"Found {len(self._voices)} Piper voice(s): {list(self._voices.keys())}")
 
     def list_voices(self) -> list[str]:
+        if self.engine == "kokoro":
+            return list(_KOKORO_VOICES)
         return list(self._voices.keys())
 
     def synthesize(self, text: str, voice: str = None, speed: float = 1.0) -> bytes:
@@ -717,6 +778,42 @@ class TTSService:
 
         return wav_bytes
 
+    def _get_kokoro(self):
+        if self._kokoro is None:
+            from mlx_audio.tts.utils import load_model
+            log.info(f"Loading Kokoro TTS model into memory: {self.mlx_model}")
+            self._kokoro = load_model(self.mlx_model)
+        return self._kokoro
+
+    def _do_synthesize_kokoro(self, text: str, voice: str, speed: float) -> bytes:
+        import glob as _glob
+        import tempfile
+        from mlx_audio.tts.generate import generate_audio
+
+        model = self._get_kokoro()
+        v = voice if voice in _KOKORO_VOICES else self.mlx_voice
+        # mlx-audio's Kokoro vocoder has an intermittent, non-deterministic shape
+        # mismatch in its sine-source generator; retry a few times since each
+        # attempt re-rolls the failing random op.
+        last_err = None
+        for attempt in range(4):
+            try:
+                with tempfile.TemporaryDirectory() as td:
+                    generate_audio(
+                        text=text, model=model, voice=v, speed=speed,
+                        output_path=td, file_prefix="tts", audio_format="wav",
+                        join_audio=True, save=True, verbose=False,
+                    )
+                    outs = sorted(_glob.glob(f"{td}/tts*.wav"))
+                    if outs:
+                        return Path(outs[0]).read_bytes()
+                    last_err = RuntimeError("Kokoro produced no audio")
+            except Exception as e:
+                last_err = e
+            if attempt:
+                log.warning(f"Kokoro synth retry {attempt + 1}/4 ({last_err})")
+        raise RuntimeError(f"Kokoro synthesis failed after retries: {last_err}")
+
     def _get_piper_voice(self, voice: str):
         """Get or load a PiperVoice model — cached in memory after first load."""
         if voice in self._loaded_voices:
@@ -732,6 +829,9 @@ class TTSService:
         return piper_voice
 
     def _do_synthesize(self, text: str, voice: str, speed: float) -> bytes:
+        if self.engine == "kokoro":
+            return self._do_synthesize_kokoro(text, voice, speed)
+
         import wave as wave_mod
 
         if not voice and self._voices:
@@ -764,7 +864,10 @@ class TTSService:
 
     def unload(self):
         self._cache.clear()
-        self._loaded_voices.clear()
+        if self.engine == "kokoro":
+            self._kokoro = None
+        else:
+            self._loaded_voices.clear()
 
 
 # ===================================================================
@@ -1293,13 +1396,14 @@ class VisionService:
         log.info(f"Loading vision model: {model_name} (backend: {self.backend}, device: {device})...")
         loader = {"blip": self._load_blip, "blip2": self._load_blip2,
                   "moondream": self._load_moondream, "florence": self._load_florence,
-                  "generic": self._load_generic}
+                  "mlx": self._load_mlx, "generic": self._load_generic}
         loader[self.backend]()
         log.info(f"Vision model loaded ({self.backend}).")
 
     @staticmethod
     def _detect_backend(name: str) -> str:
         n = name.lower()
+        if "mlx" in n:         return "mlx"
         if "moondream" in n:   return "moondream"
         if "florence" in n:    return "florence"
         if "blip-2" in n or "blip2" in n: return "blip2"
@@ -1354,10 +1458,22 @@ class VisionService:
                 torch_dtype=self._dtype, trust_remote_code=True)
         self.model.to(self._device).eval()
 
+    def _load_mlx(self):
+        # Quantized VLM via Apple MLX (e.g. mlx-community/Qwen2.5-VL-7B-Instruct-4bit).
+        # ~3-4x less memory than fp16 transformers and faster on Apple Silicon.
+        from mlx_vlm import load as _mlx_load
+        from mlx_vlm.utils import load_config as _mlx_load_config
+        self._mlx_model, self.processor = _mlx_load(self.model_name)
+        self._mlx_config = _mlx_load_config(self.model_name)
+
     # -- caption dispatch --------------------------------------------------
-    def caption(self, image_bytes: bytes, prompt: str = None) -> str:
+    def caption(self, image_bytes: bytes, prompt: str = None, temperature: float = None) -> str:
         from PIL import Image
         image = Image.open(BytesIO(image_bytes)).convert("RGB")
+        # Only the MLX VLM backend honors sampling temperature (used by the
+        # multimodal chat bridge so the persona's humor setting carries through).
+        if self.backend == "mlx":
+            return self._caption_mlx(image, prompt, temperature)
         fn = {"blip": self._caption_blip, "blip2": self._caption_blip,
               "moondream": self._caption_moondream, "florence": self._caption_florence,
               "generic": self._caption_generic}
@@ -1384,6 +1500,16 @@ class VisionService:
         text = self.processor.batch_decode(ids, skip_special_tokens=False)[0]
         parsed = self.processor.post_process_generation(text, task=task, image_size=(image.width, image.height))
         return parsed.get(task, text).strip()
+
+    def _caption_mlx(self, image, prompt, temperature=None):
+        from mlx_vlm import generate as _mlx_generate
+        from mlx_vlm.prompt_utils import apply_chat_template as _mlx_apply
+        question = prompt or "Describe this image."
+        formatted = _mlx_apply(self.processor, self._mlx_config, question, num_images=1)
+        temp = 0.0 if temperature is None else float(temperature)
+        result = _mlx_generate(self._mlx_model, self.processor, formatted,
+                               image=[image], max_tokens=256, temperature=temp, verbose=False)
+        return getattr(result, "text", str(result)).strip()
 
     def _caption_generic(self, image, prompt):
         text_input = prompt or "Describe this image."
@@ -1967,6 +2093,74 @@ async def websocket_stt(ws: WebSocket):
 
 # -- LLM Routes -------------------------------------------------------
 
+def _decode_data_url(url: str):
+    """Decode a base64 data URL (or bare base64) to bytes; None on failure."""
+    if not url:
+        return None
+    try:
+        if url.startswith("data:"):
+            url = url.split(",", 1)[1]
+        return base64.b64decode(url)
+    except Exception:
+        return None
+
+
+def _extract_vision_request(messages):
+    """If the chat carries an image, return (image_bytes, prompt_text); else (None, None).
+
+    prompt_text combines any system text with the latest user message's text parts,
+    so the VLM keeps the persona instructions and the actual question.
+    """
+    image_bytes = None
+    system_text = ""
+    user_text = ""
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        if isinstance(content, list):
+            texts = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    texts.append(part.get("text", ""))
+                elif part.get("type") == "image_url":
+                    b = _decode_data_url((part.get("image_url") or {}).get("url", ""))
+                    if b:
+                        image_bytes = b
+            joined = " ".join(t for t in texts if t).strip()
+            if role == "system" and joined:
+                system_text = joined
+            elif role == "user" and joined:
+                user_text = joined
+        elif isinstance(content, str):
+            if role == "system":
+                system_text = content
+            elif role == "user":
+                user_text = content
+    if image_bytes is None:
+        return None, None
+    prompt = user_text or "Describe what you see."
+    if system_text:
+        prompt = f"{system_text}\n\n{prompt}"
+    return image_bytes, prompt
+
+
+def _vlm_sse(text: str, model_name: str):
+    """Yield OpenAI-style SSE chunks for a single (non-streamed) VLM answer."""
+    cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+    chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
+             "model": model_name,
+             "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]}
+    yield f"data: {json.dumps(chunk)}\n\n"
+    final = {"id": cid, "object": "chat.completion.chunk", "created": created,
+             "model": model_name,
+             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+    yield f"data: {json.dumps(final)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
 @app.post("/v1/chat/completions")
 async def llm_chat(request: Request):
     if "llm" not in SERVICES:
@@ -1994,6 +2188,29 @@ async def llm_chat(request: Request):
         top_p = body.get("top_p", 0.95)
         stream = body.get("stream", False)
         session_id = request.headers.get("x-session-id")
+
+        # Multimodal bridge: the text LLM can't see images, so route image-bearing
+        # chats to the vision VLM. Enables the app's directLLM vision mode.
+        vlm_image, vlm_prompt = _extract_vision_request(messages)
+        if vlm_image is not None and "vision" in SERVICES:
+            loop = asyncio.get_event_loop()
+            answer = await loop.run_in_executor(
+                _INFERENCE_POOL,
+                lambda: SERVICES["vision"].caption(vlm_image, prompt=vlm_prompt, temperature=temperature),
+            )
+            vmodel = getattr(SERVICES["vision"], "model_name", "vision")
+            log.info(f"Chat (vision VLM): \"{answer}\"")
+            if stream:
+                return StreamingResponse(
+                    _vlm_sse(answer, vmodel), media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                )
+            return JSONResponse({
+                "id": f"chatcmpl-{uuid.uuid4().hex[:12]}", "object": "chat.completion",
+                "created": int(time.time()), "model": vmodel,
+                "choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": answer}}],
+            })
 
         if stream:
             generator = SERVICES["llm"].chat(
@@ -2922,7 +3139,11 @@ def _load_single_service(name: str, args):
                                      vad_filter=vad, device=dev)
     elif name == "tts":
         cache_size = cfg.getint("tts", "cache_size", fallback=100)
-        SERVICES["tts"] = TTSService(voices_dir=args.voices_dir, cache_size=cache_size)
+        engine = cfg.get("tts", "engine", fallback="piper")
+        mlx_model = cfg.get("tts", "mlx_model", fallback="prince-canuma/Kokoro-82M")
+        mlx_voice = cfg.get("tts", "mlx_voice", fallback="af_heart")
+        SERVICES["tts"] = TTSService(voices_dir=args.voices_dir, cache_size=cache_size,
+                                     engine=engine, mlx_model=mlx_model, mlx_voice=mlx_voice)
     elif name == "llm":
         kvs = cfg.getint("llm", "kv_cache_sessions", fallback=2)
         kvt = cfg.getint("llm", "kv_cache_ttl", fallback=300)
