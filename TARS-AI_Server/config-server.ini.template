@@ -1,0 +1,76 @@
+# TARS-AI Companion Server — configuration template.
+# Copy to config-server.ini and fill in the api_key:
+#   cp config-server.ini.template config-server.ini
+# config-server.ini is git-ignored (it holds the API key); this template is tracked.
+
+[server]
+port = 5678
+# Generate a key, e.g.:  python3 -c "import secrets; print(secrets.token_urlsafe(24))"
+api_key = CHANGE_ME
+
+[services]
+stt = true
+tts = true
+llm = true
+vision = true
+imagegen = false
+musicgen = false
+embeddings = false
+
+[stt]
+# An "mlx-community/..." repo selects the Apple-Silicon MLX backend (RTF ~0.45x).
+# A plain size (small, large-v3, ...) uses faster-whisper instead.
+whisper_model = mlx-community/whisper-large-v3-turbo
+compute_type = auto
+vad_filter = true
+device = auto
+
+[llm]
+model = Qwen/Qwen3-4B
+dtype = auto
+quantize = none
+backend = auto
+n_ctx = 4096
+n_gpu_layers = -1
+n_batch = 2048
+flash_attn = true
+kv_cache_sessions = 2
+kv_cache_ttl = 300
+device = auto
+
+[tts]
+voices_dir =
+default_voice =
+cache_size = 100
+# engine: piper (ONNX) or kokoro (Apple-Silicon MLX, ~0.4 GB, many voices)
+engine = kokoro
+mlx_model = prince-canuma/Kokoro-82M
+mlx_voice = af_heart
+
+[vision]
+# MLX (Apple Silicon) quantized VLM — prompt-following VQA, ~6.4 GB peak.
+# Falls back to any HF captioner name (e.g. Salesforce/blip-image-captioning-base).
+model = mlx-community/Qwen2.5-VL-7B-Instruct-4bit
+device = auto
+
+[imagegen]
+model = stabilityai/stable-diffusion-xl-base-1.0
+default_steps = 20
+default_cfg = 7.0
+device = auto
+
+[musicgen]
+model = ACE-Step/ACE-Step-v1-3.5B
+default_duration = 60
+default_steps = 60
+default_cfg = 15.0
+default_scheduler = euler
+default_cfg_type = apg
+default_omega_scale = 10.0
+default_guidance_interval = 0.5
+default_min_guidance = 3.0
+device = auto
+
+[embeddings]
+model = all-MiniLM-L6-v2
+device = auto
